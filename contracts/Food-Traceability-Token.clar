@@ -7,6 +7,7 @@
 (define-constant err-already-exists (err u103))
 (define-constant err-invalid-stage (err u104))
 (define-constant err-unauthorized-oracle (err u105))
+(define-constant err-invalid-score (err u106))
 
 (define-data-var token-id-nonce uint u1)
 
@@ -44,6 +45,19 @@
     issuer: principal,
     valid-until: uint,
     cert-data: (string-ascii 200)
+  }
+)
+
+(define-map quality-scores
+  uint
+  {
+    base-score: uint,
+    temperature-penalty: uint,
+    time-penalty: uint,
+    certification-bonus: uint,
+    final-score: uint,
+    grade: (string-ascii 1),
+    calculated-at: uint
   }
 )
 
@@ -250,6 +264,106 @@
   (match (map-get? batch-info batch-id)
     batch-data
       (ok (get current-stage batch-data))
+    (err err-invalid-batch)
+  )
+)
+
+(define-public (calculate-quality-score (batch-id uint))
+  (let
+    (
+      (batch-data (unwrap! (map-get? batch-info batch-id) err-invalid-batch))
+      (current-stage (get current-stage batch-data))
+      (base-score u100)
+      (temp-penalty (calculate-temperature-penalty batch-id current-stage))
+      (time-penalty (calculate-time-penalty batch-id))
+      (cert-bonus (if (get certified batch-data) u10 u0))
+      (total-penalty (+ temp-penalty time-penalty))
+      (raw-score (if (>= base-score total-penalty) (- base-score total-penalty) u0))
+      (final-score (+ raw-score cert-bonus))
+      (grade (get-quality-grade final-score))
+    )
+    (map-set quality-scores batch-id
+      {
+        base-score: base-score,
+        temperature-penalty: temp-penalty,
+        time-penalty: time-penalty,
+        certification-bonus: cert-bonus,
+        final-score: final-score,
+        grade: grade,
+        calculated-at: stacks-block-height
+      }
+    )
+    (ok final-score)
+  )
+)
+
+(define-private (calculate-temperature-penalty (batch-id uint) (max-stage uint))
+  (get penalty (fold check-temperature-violations 
+    (list u1 u2 u3 u4 u5 u6 u7 u8 u9 u10) 
+    { batch-id: batch-id, max-stage: max-stage, penalty: u0 }
+  ))
+)
+
+(define-private (check-temperature-violations (stage-id uint) (acc { batch-id: uint, max-stage: uint, penalty: uint }))
+  (if (<= stage-id (get max-stage acc))
+    (match (map-get? supply-chain-stages { batch-id: (get batch-id acc), stage-id: stage-id })
+      stage-data
+        (match (get temperature stage-data)
+          temp-value
+            (if (or (< temp-value -5) (> temp-value 25))
+              (merge acc { penalty: (+ (get penalty acc) u5) })
+              acc
+            )
+          acc
+        )
+      acc
+    )
+    acc
+  )
+)
+
+(define-private (calculate-time-penalty (batch-id uint))
+  (match (map-get? batch-info batch-id)
+    batch-data
+      (let
+        (
+          (harvest-date (get harvest-date batch-data))
+          (current-block stacks-block-height)
+          (age (- current-block harvest-date))
+        )
+        (if (> age u2016) 
+          (if (> age u4032) u20 u10)
+          u0
+        )
+      )
+    u0
+  )
+)
+
+(define-private (get-quality-grade (score uint))
+  (if (>= score u90) "A"
+    (if (>= score u80) "B"
+      (if (>= score u70) "C"
+        (if (>= score u60) "D"
+          "F"
+        )
+      )
+    )
+  )
+)
+
+(define-read-only (get-quality-score (batch-id uint))
+  (map-get? quality-scores batch-id)
+)
+
+(define-read-only (get-batch-quality-summary (batch-id uint))
+  (match (map-get? quality-scores batch-id)
+    score-data
+      (ok {
+        score: (get final-score score-data),
+        grade: (get grade score-data),
+        calculated-at: (get calculated-at score-data)
+      })
     (err err-invalid-batch)
   )
 )
