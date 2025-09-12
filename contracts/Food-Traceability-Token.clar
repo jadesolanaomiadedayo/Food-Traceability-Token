@@ -8,6 +8,9 @@
 (define-constant err-invalid-stage (err u104))
 (define-constant err-unauthorized-oracle (err u105))
 (define-constant err-invalid-score (err u106))
+(define-constant err-batch-already-recalled (err u107))
+(define-constant err-invalid-recall-reason (err u108))
+(define-constant err-recall-not-found (err u109))
 
 (define-data-var token-id-nonce uint u1)
 
@@ -60,6 +63,32 @@
     calculated-at: uint
   }
 )
+
+(define-map batch-recalls
+  uint
+  {
+    recalled: bool,
+    recall-reason: (string-ascii 200),
+    severity-level: uint,
+    recalled-by: principal,
+    recall-date: uint,
+    affected-consumers: uint,
+    recall-id: (string-ascii 50)
+  }
+)
+
+(define-map recall-notifications
+  { batch-id: uint, notification-id: uint }
+  {
+    recipient: principal,
+    message: (string-ascii 300),
+    sent-at: uint,
+    acknowledged: bool,
+    urgency: uint
+  }
+)
+
+(define-data-var notification-id-nonce uint u1)
 
 (define-read-only (get-last-token-id)
   (ok (- (var-get token-id-nonce) u1))
@@ -365,5 +394,148 @@
         calculated-at: (get calculated-at score-data)
       })
     (err err-invalid-batch)
+  )
+)
+
+(define-public (initiate-batch-recall
+    (batch-id uint)
+    (recall-reason (string-ascii 200))
+    (severity-level uint)
+    (affected-consumers uint)
+    (recall-id (string-ascii 50)))
+  (let
+    (
+      (batch-data (unwrap! (map-get? batch-info batch-id) err-invalid-batch))
+      (is-oracle (default-to false (map-get? authorized-oracles tx-sender)))
+      (existing-recall (map-get? batch-recalls batch-id))
+    )
+    (asserts! (or is-oracle (is-eq tx-sender contract-owner)) err-unauthorized-oracle)
+    (asserts! (and (>= severity-level u1) (<= severity-level u5)) err-invalid-recall-reason)
+    (asserts! (is-none existing-recall) err-batch-already-recalled)
+    (map-set batch-recalls batch-id
+      {
+        recalled: true,
+        recall-reason: recall-reason,
+        severity-level: severity-level,
+        recalled-by: tx-sender,
+        recall-date: stacks-block-height,
+        affected-consumers: affected-consumers,
+        recall-id: recall-id
+      }
+    )
+    (ok true)
+  )
+)
+
+(define-public (send-recall-notification
+    (batch-id uint)
+    (recipient principal)
+    (message (string-ascii 300))
+    (urgency uint))
+  (let
+    (
+      (recall-data (unwrap! (map-get? batch-recalls batch-id) err-recall-not-found))
+      (is-oracle (default-to false (map-get? authorized-oracles tx-sender)))
+      (notification-id (var-get notification-id-nonce))
+    )
+    (asserts! (or is-oracle (is-eq tx-sender contract-owner)) err-unauthorized-oracle)
+    (asserts! (get recalled recall-data) err-recall-not-found)
+    (asserts! (and (>= urgency u1) (<= urgency u3)) err-invalid-recall-reason)
+    (map-set recall-notifications { batch-id: batch-id, notification-id: notification-id }
+      {
+        recipient: recipient,
+        message: message,
+        sent-at: stacks-block-height,
+        acknowledged: false,
+        urgency: urgency
+      }
+    )
+    (var-set notification-id-nonce (+ notification-id u1))
+    (ok notification-id)
+  )
+)
+
+(define-public (acknowledge-recall-notification
+    (batch-id uint)
+    (notification-id uint))
+  (let
+    (
+      (notification-data (unwrap! (map-get? recall-notifications { batch-id: batch-id, notification-id: notification-id }) err-recall-not-found))
+    )
+    (asserts! (is-eq tx-sender (get recipient notification-data)) err-not-token-owner)
+    (map-set recall-notifications { batch-id: batch-id, notification-id: notification-id }
+      (merge notification-data { acknowledged: true })
+    )
+    (ok true)
+  )
+)
+
+(define-public (update-recall-status
+    (batch-id uint)
+    (new-severity uint)
+    (additional-info (string-ascii 200)))
+  (let
+    (
+      (recall-data (unwrap! (map-get? batch-recalls batch-id) err-recall-not-found))
+      (is-oracle (default-to false (map-get? authorized-oracles tx-sender)))
+    )
+    (asserts! (or is-oracle (is-eq tx-sender contract-owner)) err-unauthorized-oracle)
+    (asserts! (get recalled recall-data) err-recall-not-found)
+    (asserts! (and (>= new-severity u1) (<= new-severity u5)) err-invalid-recall-reason)
+    (map-set batch-recalls batch-id
+      (merge recall-data {
+        severity-level: new-severity,
+        recall-reason: additional-info
+      })
+    )
+    (ok true)
+  )
+)
+
+(define-read-only (get-batch-recall-status (batch-id uint))
+  (map-get? batch-recalls batch-id)
+)
+
+(define-read-only (is-batch-recalled (batch-id uint))
+  (match (map-get? batch-recalls batch-id)
+    recall-data (ok (get recalled recall-data))
+    (ok false)
+  )
+)
+
+(define-read-only (get-recall-notification (batch-id uint) (notification-id uint))
+  (map-get? recall-notifications { batch-id: batch-id, notification-id: notification-id })
+)
+
+(define-read-only (check-batch-safety (batch-id uint))
+  (let
+    (
+      (batch-data (unwrap! (map-get? batch-info batch-id) err-invalid-batch))
+      (recall-status (map-get? batch-recalls batch-id))
+      (quality-data (map-get? quality-scores batch-id))
+    )
+    (ok {
+      exists: true,
+      recalled: (match recall-status
+        recall-info (get recalled recall-info)
+        false
+      ),
+      certified: (get certified batch-data),
+      quality-grade: (match quality-data
+        score-info (get grade score-info)
+        "N/A"
+      ),
+      safe-for-consumption: (and
+        (not (match recall-status
+          recall-info (get recalled recall-info)
+          false
+        ))
+        (get certified batch-data)
+        (match quality-data
+          score-info (>= (get final-score score-info) u70)
+          false
+        )
+      )
+    })
   )
 )
