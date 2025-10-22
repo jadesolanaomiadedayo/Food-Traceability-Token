@@ -11,6 +11,9 @@
 (define-constant err-batch-already-recalled (err u107))
 (define-constant err-invalid-recall-reason (err u108))
 (define-constant err-recall-not-found (err u109))
+(define-constant err-audit-access-denied (err u110))
+(define-constant err-invalid-audit-period (err u111))
+(define-constant err-audit-not-found (err u112))
 
 (define-data-var token-id-nonce uint u1)
 
@@ -89,6 +92,70 @@
 )
 
 (define-data-var notification-id-nonce uint u1)
+(define-data-var audit-id-nonce uint u1)
+
+;; Audit trail system for compliance and transparency
+(define-map audit-trail
+  uint
+  {
+    operation-type: (string-ascii 50),
+    actor: principal,
+    target-batch: (optional uint),
+    operation-data: (string-ascii 300),
+    timestamp: uint,
+    block-height: uint,
+    gas-cost: uint,
+    success: bool,
+    error-code: (optional uint)
+  }
+)
+
+(define-map audit-permissions principal bool)
+
+(define-map compliance-reports
+  { period-start: uint, period-end: uint }
+  {
+    total-operations: uint,
+    successful-operations: uint,
+    failed-operations: uint,
+    unique-actors: uint,
+    batch-operations: uint,
+    oracle-operations: uint,
+    recall-operations: uint,
+    quality-assessments: uint,
+    generated-by: principal,
+    generated-at: uint
+  }
+)
+
+;; Audit trail utility functions
+(define-private (log-operation 
+    (op-type (string-ascii 50))
+    (batch-id (optional uint))
+    (op-data (string-ascii 300))
+    (success bool)
+    (error-code (optional uint)))
+  (let
+    (
+      (audit-id (var-get audit-id-nonce))
+    )
+    (map-set audit-trail audit-id
+      {
+        operation-type: op-type,
+        actor: tx-sender,
+        target-batch: batch-id,
+        operation-data: op-data,
+        timestamp: stacks-block-height,
+        block-height: stacks-block-height,
+        gas-cost: u0,
+        success: success,
+        error-code: error-code
+      }
+    )
+    (var-set audit-id-nonce (+ audit-id u1))
+    audit-id
+  )
+)
 
 (define-read-only (get-last-token-id)
   (ok (- (var-get token-id-nonce) u1))
@@ -109,9 +176,30 @@
   )
 )
 
+;; Audit management functions
+(define-public (grant-audit-access (auditor principal))
+  (begin
+    (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+    (log-operation "GRANT_AUDIT_ACCESS" none 
+      "Granted audit access to new auditor" true none)
+    (ok (map-set audit-permissions auditor true))
+  )
+)
+
+(define-public (revoke-audit-access (auditor principal))
+  (begin
+    (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+    (log-operation "REVOKE_AUDIT_ACCESS" none 
+      "Revoked audit access from auditor" true none)
+    (ok (map-delete audit-permissions auditor))
+  )
+)
+
 (define-public (add-oracle (oracle principal))
   (begin
     (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+    (log-operation "ADD_ORACLE" none 
+      "Added new oracle to system" true none)
     (ok (map-set authorized-oracles oracle true))
   )
 )
@@ -119,6 +207,8 @@
 (define-public (remove-oracle (oracle principal))
   (begin
     (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+    (log-operation "REMOVE_ORACLE" none 
+      "Removed oracle from system" true none)
     (ok (map-delete authorized-oracles oracle))
   )
 )
@@ -155,6 +245,8 @@
       }
     )
     (var-set token-id-nonce (+ token-id u1))
+    (log-operation "CREATE_BATCH" (some token-id)
+      (concat "Created batch: " product-name) true none)
     (ok token-id)
   )
 )
@@ -188,6 +280,8 @@
     (map-set batch-info batch-id
       (merge batch-data { current-stage: new-stage })
     )
+    (log-operation "UPDATE_STAGE" (some batch-id)
+      (concat "Stage updated to: " location) true none)
     (ok new-stage)
   )
 )
@@ -213,6 +307,8 @@
     (map-set batch-info batch-id
       (merge batch-data { certified: true })
     )
+    (log-operation "ADD_CERTIFICATION" (some batch-id)
+      (concat "Added certification: " cert-type) true none)
     (ok true)
   )
 )
@@ -322,6 +418,8 @@
         calculated-at: stacks-block-height
       }
     )
+    (log-operation "CALCULATE_QUALITY" (some batch-id)
+      (concat "Quality score calculated: " (get grade (unwrap-panic (map-get? quality-scores batch-id)))) true none)
     (ok final-score)
   )
 )
@@ -423,6 +521,8 @@
         recall-id: recall-id
       }
     )
+    (log-operation "INITIATE_RECALL" (some batch-id)
+      (concat "Batch recalled: " recall-reason) true none)
     (ok true)
   )
 )
@@ -451,6 +551,8 @@
       }
     )
     (var-set notification-id-nonce (+ notification-id u1))
+    (log-operation "SEND_RECALL_NOTIFICATION" (some batch-id)
+      "Recall notification sent" true none)
     (ok notification-id)
   )
 )
@@ -536,6 +638,189 @@
           false
         )
       )
+    })
+  )
+)
+
+;; Audit trail query functions
+(define-read-only (get-audit-entry (audit-id uint))
+  (map-get? audit-trail audit-id)
+)
+
+(define-read-only (get-batch-audit-trail (batch-id uint))
+  (let
+    (
+      (current-audit-id (var-get audit-id-nonce))
+      (audit-entries (fold collect-batch-audit-entries
+        (list u1 u2 u3 u4 u5 u6 u7 u8 u9 u10 u11 u12 u13 u14 u15 u16 u17 u18 u19 u20)
+        { target-batch: batch-id, max-id: current-audit-id, entries: (list) }
+      ))
+    )
+    (ok (get entries audit-entries))
+  )
+)
+
+(define-private (collect-batch-audit-entries (id uint) (acc { target-batch: uint, max-id: uint, entries: (list 20 uint) }))
+  (if (<= id (get max-id acc))
+    (match (map-get? audit-trail id)
+      audit-entry
+        (if (is-eq (get target-batch acc) (default-to u0 (get target-batch audit-entry)))
+          (merge acc { entries: (unwrap-panic (as-max-len? (append (get entries acc) id) u20)) })
+          acc
+        )
+      acc
+    )
+    acc
+  )
+)
+
+(define-read-only (get-actor-audit-trail (actor principal) (limit uint))
+  (let
+    (
+      (current-audit-id (var-get audit-id-nonce))
+      (audit-entries (fold collect-actor-audit-entries
+        (list u1 u2 u3 u4 u5 u6 u7 u8 u9 u10 u11 u12 u13 u14 u15 u16 u17 u18 u19 u20)
+        { target-actor: actor, max-id: current-audit-id, limit: limit, entries: (list) }
+      ))
+    )
+    (ok (get entries audit-entries))
+  )
+)
+
+(define-private (collect-actor-audit-entries (id uint) (acc { target-actor: principal, max-id: uint, limit: uint, entries: (list 20 uint) }))
+  (if (and (<= id (get max-id acc)) (< (len (get entries acc)) (get limit acc)))
+    (match (map-get? audit-trail id)
+      audit-entry
+        (if (is-eq (get target-actor acc) (get actor audit-entry))
+          (merge acc { entries: (unwrap-panic (as-max-len? (append (get entries acc) id) u20)) })
+          acc
+        )
+      acc
+    )
+    acc
+  )
+)
+
+(define-public (generate-compliance-report (period-start uint) (period-end uint))
+  (let
+    (
+      (is-auditor (or (is-eq tx-sender contract-owner) 
+                     (default-to false (map-get? audit-permissions tx-sender))))
+      (current-audit-id (var-get audit-id-nonce))
+    )
+    (asserts! is-auditor err-audit-access-denied)
+    (asserts! (< period-start period-end) err-invalid-audit-period)
+    
+    (let
+      (
+        (report-data (fold analyze-audit-entry
+          (list u1 u2 u3 u4 u5 u6 u7 u8 u9 u10 u11 u12 u13 u14 u15 u16 u17 u18 u19 u20 u21 u22 u23 u24 u25 u26 u27 u28 u29 u30 u31 u32 u33 u34 u35 u36 u37 u38 u39 u40 u41 u42 u43 u44 u45 u46 u47 u48 u49 u50)
+          {
+            period-start: period-start,
+            period-end: period-end,
+            max-id: current-audit-id,
+            total-ops: u0,
+            success-ops: u0,
+            failed-ops: u0,
+            batch-ops: u0,
+            oracle-ops: u0,
+            recall-ops: u0,
+            quality-ops: u0,
+            unique-actors: (list)
+          }
+        ))
+      )
+      (map-set compliance-reports { period-start: period-start, period-end: period-end }
+        {
+          total-operations: (get total-ops report-data),
+          successful-operations: (get success-ops report-data),
+          failed-operations: (get failed-ops report-data),
+          unique-actors: (len (get unique-actors report-data)),
+          batch-operations: (get batch-ops report-data),
+          oracle-operations: (get oracle-ops report-data),
+          recall-operations: (get recall-ops report-data),
+          quality-assessments: (get quality-ops report-data),
+          generated-by: tx-sender,
+          generated-at: stacks-block-height
+        }
+      )
+      (log-operation "GENERATE_COMPLIANCE_REPORT" none
+        "Compliance report generated for specified period" true none)
+      (ok true)
+    )
+  )
+)
+
+(define-private (analyze-audit-entry (id uint) 
+    (acc { 
+      period-start: uint, 
+      period-end: uint, 
+      max-id: uint, 
+      total-ops: uint, 
+      success-ops: uint, 
+      failed-ops: uint, 
+      batch-ops: uint, 
+      oracle-ops: uint, 
+      recall-ops: uint, 
+      quality-ops: uint, 
+      unique-actors: (list 50 principal) 
+    }))
+  (if (<= id (get max-id acc))
+    (match (map-get? audit-trail id)
+      audit-entry
+        (if (and (>= (get timestamp audit-entry) (get period-start acc))
+                 (<= (get timestamp audit-entry) (get period-end acc)))
+          (let
+            (
+              (op-type (get operation-type audit-entry))
+              (is-success (get success audit-entry))
+              (actor (get actor audit-entry))
+              (updated-actors (if (is-none (index-of (get unique-actors acc) actor))
+                               (unwrap-panic (as-max-len? (append (get unique-actors acc) actor) u50))
+                               (get unique-actors acc)))
+            )
+            (merge acc {
+              total-ops: (+ (get total-ops acc) u1),
+              success-ops: (if is-success (+ (get success-ops acc) u1) (get success-ops acc)),
+              failed-ops: (if (not is-success) (+ (get failed-ops acc) u1) (get failed-ops acc)),
+              batch-ops: (if (or (is-eq op-type "CREATE_BATCH") (is-eq op-type "UPDATE_STAGE"))
+                           (+ (get batch-ops acc) u1) (get batch-ops acc)),
+              oracle-ops: (if (or (is-eq op-type "ADD_ORACLE") (is-eq op-type "REMOVE_ORACLE") 
+                                 (is-eq op-type "ADD_CERTIFICATION"))
+                            (+ (get oracle-ops acc) u1) (get oracle-ops acc)),
+              recall-ops: (if (or (is-eq op-type "INITIATE_RECALL") (is-eq op-type "SEND_RECALL_NOTIFICATION"))
+                            (+ (get recall-ops acc) u1) (get recall-ops acc)),
+              quality-ops: (if (is-eq op-type "CALCULATE_QUALITY")
+                             (+ (get quality-ops acc) u1) (get quality-ops acc)),
+              unique-actors: updated-actors
+            })
+          )
+          acc
+        )
+      acc
+    )
+    acc
+  )
+)
+
+(define-read-only (get-compliance-report (period-start uint) (period-end uint))
+  (map-get? compliance-reports { period-start: period-start, period-end: period-end })
+)
+
+(define-read-only (is-auditor (address principal))
+  (or (is-eq address contract-owner) 
+      (default-to false (map-get? audit-permissions address)))
+)
+
+(define-read-only (get-audit-statistics)
+  (let
+    (
+      (total-audits (- (var-get audit-id-nonce) u1))
+    )
+    (ok {
+      total-audit-entries: total-audits,
+      contract-owner: contract-owner,
+      current-block: stacks-block-height
     })
   )
 )
