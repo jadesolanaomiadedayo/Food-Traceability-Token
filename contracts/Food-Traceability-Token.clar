@@ -14,6 +14,9 @@
 (define-constant err-audit-access-denied (err u110))
 (define-constant err-invalid-audit-period (err u111))
 (define-constant err-audit-not-found (err u112))
+(define-constant err-expired-batch (err u113))
+(define-constant err-invalid-expiration (err u114))
+(define-constant err-expiration-exists (err u115))
 
 (define-data-var token-id-nonce uint u1)
 
@@ -93,6 +96,7 @@
 
 (define-data-var notification-id-nonce uint u1)
 (define-data-var audit-id-nonce uint u1)
+(define-data-var expiration-alert-nonce uint u1)
 
 ;; Audit trail system for compliance and transparency
 (define-map audit-trail
@@ -111,6 +115,30 @@
 )
 
 (define-map audit-permissions principal bool)
+
+(define-map batch-expiration
+  uint
+  {
+    shelf-life-days: uint,
+    expiration-date: uint,
+    product-category: (string-ascii 30),
+    storage-conditions: (string-ascii 100),
+    set-by: principal,
+    set-at: uint
+  }
+)
+
+(define-map expiration-alerts
+  uint
+  {
+    batch-id: uint,
+    alert-type: (string-ascii 20),
+    days-until-expiration: int,
+    triggered-at: uint,
+    notified-parties: (list 5 principal),
+    resolved: bool
+  }
+)
 
 (define-map compliance-reports
   { period-start: uint, period-end: uint }
@@ -822,5 +850,215 @@
       contract-owner: contract-owner,
       current-block: stacks-block-height
     })
+  )
+)
+
+(define-public (set-batch-expiration
+    (batch-id uint)
+    (shelf-life-days uint)
+    (product-category (string-ascii 30))
+    (storage-conditions (string-ascii 100)))
+  (let
+    (
+      (batch-data (unwrap! (map-get? batch-info batch-id) err-invalid-batch))
+      (is-oracle (default-to false (map-get? authorized-oracles tx-sender)))
+      (is-owner (is-eq tx-sender (unwrap! (nft-get-owner? food-batch batch-id) err-invalid-batch)))
+      (harvest-date (get harvest-date batch-data))
+      (expiration-date (+ harvest-date shelf-life-days))
+      (existing-expiration (map-get? batch-expiration batch-id))
+    )
+    (asserts! (or is-oracle is-owner (is-eq tx-sender contract-owner)) err-unauthorized-oracle)
+    (asserts! (> shelf-life-days u0) err-invalid-expiration)
+    (asserts! (is-none existing-expiration) err-expiration-exists)
+    (map-set batch-expiration batch-id
+      {
+        shelf-life-days: shelf-life-days,
+        expiration-date: expiration-date,
+        product-category: product-category,
+        storage-conditions: storage-conditions,
+        set-by: tx-sender,
+        set-at: stacks-block-height
+      }
+    )
+    (log-operation "SET_EXPIRATION" (some batch-id)
+      (concat "Expiration set for category: " product-category) true none)
+    (ok expiration-date)
+  )
+)
+
+(define-public (update-batch-expiration
+    (batch-id uint)
+    (new-shelf-life-days uint)
+    (new-storage-conditions (string-ascii 100)))
+  (let
+    (
+      (batch-data (unwrap! (map-get? batch-info batch-id) err-invalid-batch))
+      (expiration-data (unwrap! (map-get? batch-expiration batch-id) err-invalid-batch))
+      (is-oracle (default-to false (map-get? authorized-oracles tx-sender)))
+      (harvest-date (get harvest-date batch-data))
+      (new-expiration-date (+ harvest-date new-shelf-life-days))
+    )
+    (asserts! (or is-oracle (is-eq tx-sender contract-owner)) err-unauthorized-oracle)
+    (asserts! (> new-shelf-life-days u0) err-invalid-expiration)
+    (map-set batch-expiration batch-id
+      (merge expiration-data {
+        shelf-life-days: new-shelf-life-days,
+        expiration-date: new-expiration-date,
+        storage-conditions: new-storage-conditions
+      })
+    )
+    (log-operation "UPDATE_EXPIRATION" (some batch-id)
+      "Expiration settings updated" true none)
+    (ok new-expiration-date)
+  )
+)
+
+(define-public (trigger-expiration-alert
+    (batch-id uint)
+    (alert-type (string-ascii 20))
+    (notified-parties (list 5 principal)))
+  (let
+    (
+      (batch-data (unwrap! (map-get? batch-info batch-id) err-invalid-batch))
+      (expiration-data (unwrap! (map-get? batch-expiration batch-id) err-invalid-batch))
+      (is-oracle (default-to false (map-get? authorized-oracles tx-sender)))
+      (expiration-date (get expiration-date expiration-data))
+      (current-block stacks-block-height)
+      (days-until-expiration (- (to-int expiration-date) (to-int current-block)))
+      (alert-id (var-get expiration-alert-nonce))
+    )
+    (asserts! (or is-oracle (is-eq tx-sender contract-owner)) err-unauthorized-oracle)
+    (map-set expiration-alerts alert-id
+      {
+        batch-id: batch-id,
+        alert-type: alert-type,
+        days-until-expiration: days-until-expiration,
+        triggered-at: current-block,
+        notified-parties: notified-parties,
+        resolved: false
+      }
+    )
+    (var-set expiration-alert-nonce (+ alert-id u1))
+    (log-operation "TRIGGER_EXPIRATION_ALERT" (some batch-id)
+      (concat "Expiration alert: " alert-type) true none)
+    (ok alert-id)
+  )
+)
+
+(define-public (resolve-expiration-alert (alert-id uint))
+  (let
+    (
+      (alert-data (unwrap! (map-get? expiration-alerts alert-id) err-invalid-batch))
+      (is-oracle (default-to false (map-get? authorized-oracles tx-sender)))
+    )
+    (asserts! (or is-oracle (is-eq tx-sender contract-owner)) err-unauthorized-oracle)
+    (map-set expiration-alerts alert-id
+      (merge alert-data { resolved: true })
+    )
+    (ok true)
+  )
+)
+
+(define-read-only (get-batch-expiration (batch-id uint))
+  (map-get? batch-expiration batch-id)
+)
+
+(define-read-only (check-batch-expiration-status (batch-id uint))
+  (match (map-get? batch-expiration batch-id)
+    expiration-data
+      (let
+        (
+          (expiration-date (get expiration-date expiration-data))
+          (current-block stacks-block-height)
+          (days-until-expiration (- (to-int expiration-date) (to-int current-block)))
+          (is-expired (>= current-block expiration-date))
+          (is-near-expiration (and (not is-expired) (<= days-until-expiration 7)))
+        )
+        (ok {
+          is-expired: is-expired,
+          is-near-expiration: is-near-expiration,
+          days-until-expiration: days-until-expiration,
+          expiration-date: expiration-date,
+          product-category: (get product-category expiration-data)
+        })
+      )
+    (err err-invalid-batch)
+  )
+)
+
+(define-read-only (get-expiration-alert (alert-id uint))
+  (map-get? expiration-alerts alert-id)
+)
+
+(define-read-only (is-batch-expired (batch-id uint))
+  (match (map-get? batch-expiration batch-id)
+    expiration-data
+      (ok (>= stacks-block-height (get expiration-date expiration-data)))
+    (ok false)
+  )
+)
+
+(define-read-only (get-batches-expiring-soon (threshold-days uint))
+  (let
+    (
+      (current-token-id (var-get token-id-nonce))
+      (expiring-batches (fold check-batch-expiration-threshold
+        (list u1 u2 u3 u4 u5 u6 u7 u8 u9 u10)
+        { threshold: threshold-days, current-block: stacks-block-height, max-id: current-token-id, batches: (list) }
+      ))
+    )
+    (ok (get batches expiring-batches))
+  )
+)
+
+(define-private (check-batch-expiration-threshold (batch-id uint) 
+    (acc { threshold: uint, current-block: uint, max-id: uint, batches: (list 10 uint) }))
+  (if (< batch-id (get max-id acc))
+    (match (map-get? batch-expiration batch-id)
+      expiration-data
+        (let
+          (
+            (expiration-date (get expiration-date expiration-data))
+            (days-until (if (>= (get current-block acc) expiration-date)
+                         u0
+                         (- expiration-date (get current-block acc))))
+          )
+          (if (and (> days-until u0) (<= days-until (get threshold acc)))
+            (merge acc { batches: (unwrap-panic (as-max-len? (append (get batches acc) batch-id) u10)) })
+            acc
+          )
+        )
+      acc
+    )
+    acc
+  )
+)
+
+(define-read-only (get-batch-with-expiration-info (batch-id uint))
+  (match (map-get? batch-info batch-id)
+    batch-data
+      (match (map-get? batch-expiration batch-id)
+        expiration-data
+          (let
+            (
+              (current-block stacks-block-height)
+              (expiration-date (get expiration-date expiration-data))
+              (is-expired (>= current-block expiration-date))
+            )
+            (ok {
+              batch-info: batch-data,
+              expiration-info: (some expiration-data),
+              is-expired: is-expired,
+              current-status: (if is-expired "EXPIRED" "ACTIVE")
+            })
+          )
+        (ok {
+          batch-info: batch-data,
+          expiration-info: none,
+          is-expired: false,
+          current-status: "NO_EXPIRATION_SET"
+        })
+      )
+    (err err-invalid-batch)
   )
 )
